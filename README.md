@@ -43,7 +43,7 @@ source .venv/bin/activate
 python telegram_digest.py export
 ```
 
-Without `--days`, the exporter scans Markdown files in `exports/` and starts at the latest completed export's **end timestamp**. With no valid previous export, it starts 24 hours ago. The end of the window is the current execution time, captured before connecting to Telegram. File modification times and message timestamps never determine the checkpoint.
+Without `--days`, the exporter scans Markdown files in `exports/` and starts at the latest completed export's **end timestamp**. With no valid previous export, it starts 24 hours ago. The execution time is captured once before connecting to Telegram, and both window boundaries are rounded down to whole UTC seconds to match Telegram's timestamp precision. The current, potentially incomplete second is deferred to the next run. File modification times and message timestamps never determine the checkpoint. Existing fractional-second checkpoints are rounded down when resuming, which may reprocess their boundary second to avoid gaps.
 
 To request a fixed window, use `python telegram_digest.py export --days 3`. `--days 1` = last 24 hours; `--days 3` = last 72 hours; `--days 7` = last 168 hours, including across daylight-saving changes. `N` must be a positive integer. A successful fixed-window export also becomes a checkpoint for later incremental runs.
 

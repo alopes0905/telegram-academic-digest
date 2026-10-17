@@ -18,7 +18,8 @@ import telegram_digest as digest
 
 
 UTC = timezone.utc
-NOW = datetime(2026, 10, 17, 12, 0, 0, 123456, tzinfo=UTC)
+NOW = datetime(2026, 10, 17, 12, tzinfo=UTC)
+EXECUTION_TIME = NOW.replace(microsecond=123456)
 
 
 def checkpoint(directory, name, end, complete=True):
@@ -73,7 +74,7 @@ class FakeClient:
 
 
 class FrozenDateTime(datetime):
-    current = NOW
+    current = EXECUTION_TIME
 
     @classmethod
     def now(cls, tz=None):
@@ -111,6 +112,10 @@ class CheckpointTests(TemporaryExports):
         self.exports.mkdir()
         self.assertEqual(digest.export_start(self.exports, None, NOW), NOW - timedelta(days=1))
 
+    def test_first_run_floors_fractional_execution_time(self):
+        self.assertEqual(digest.export_start(self.exports, None, EXECUTION_TIME),
+                         NOW - timedelta(hours=24))
+
     def test_latest_end_wins_over_filename_mtime_and_message_time(self):
         older = checkpoint(self.exports, "telegram_2026-10-17_130000_last1d.md",
                            "2026-10-16T12:00:00+00:00")
@@ -122,7 +127,17 @@ class CheckpointTests(TemporaryExports):
         os.utime(older, (2000000000, 2000000000))
         os.utime(latest, (1, 1))
         self.assertEqual(digest.export_start(self.exports, None, NOW),
-                         datetime(2026, 10, 17, 11, 0, 0, 654321, tzinfo=UTC))
+                         datetime(2026, 10, 17, 11, tzinfo=UTC))
+
+    def test_future_fractional_checkpoint_in_current_second_is_ignored(self):
+        previous = NOW - timedelta(hours=1)
+        checkpoint(self.exports, "previous.md", previous.isoformat())
+        checkpoint(self.exports, "future.md", NOW.replace(microsecond=900000).isoformat())
+        self.assertEqual(digest.export_start(self.exports, None, EXECUTION_TIME), previous)
+
+    def test_past_fractional_checkpoint_in_current_second_is_accepted(self):
+        checkpoint(self.exports, "previous.md", NOW.replace(microsecond=100000).isoformat())
+        self.assertEqual(digest.export_start(self.exports, None, EXECUTION_TIME), NOW)
 
     def test_legacy_filename_uses_rome_summer_and_winter_offsets(self):
         for name, expected in [
@@ -181,13 +196,14 @@ class CheckpointTests(TemporaryExports):
         with patch.object(digest, "read_export_end", side_effect=AssertionError("Must not scan")):
             for days in (1, 3, 7, 14):
                 with self.subTest(days=days):
-                    self.assertEqual(digest.export_start(self.exports, days, NOW),
-                                     NOW - timedelta(hours=days * 24))
+                    since = digest.export_start(self.exports, days, EXECUTION_TIME)
+                    self.assertEqual(since, NOW - timedelta(hours=days * 24))
+                    self.assertEqual(NOW - since, timedelta(hours=days * 24))
 
     def test_explicit_days_remain_24_hours_across_dst_changes(self):
         for now in (datetime(2026, 3, 29, 12, tzinfo=UTC), datetime(2026, 10, 25, 12, tzinfo=UTC)):
             with self.subTest(now=now):
-                since = digest.export_start(self.exports, 1, now)
+                since = digest.export_start(self.exports, 1, now.replace(microsecond=123456))
                 self.assertEqual(now - since, timedelta(hours=24))
                 self.assertNotEqual(now.astimezone(digest.ROME).hour,
                                     since.astimezone(digest.ROME).hour)
@@ -216,7 +232,7 @@ class CheckpointTests(TemporaryExports):
 class ExportTests(TemporaryExports):
     def setUp(self):
         super().setUp()
-        FrozenDateTime.current = NOW
+        FrozenDateTime.current = EXECUTION_TIME
         self.client = FakeClient()
         self.patch("telegram_digest.ROOT", self.root)
         self.patch("telegram_digest.datetime", FrozenDateTime)
@@ -241,7 +257,7 @@ class ExportTests(TemporaryExports):
         path, = self.files()
         text = path.read_text(encoding="utf-8")
         self.assertIn("Range: 2026-10-16 14:00 CEST — 2026-10-17 14:00 CEST", text)
-        self.assertIn("Export end (UTC): 2026-10-17T12:00:00.123456+00:00", text)
+        self.assertIn("Export end (UTC): 2026-10-17T12:00:00+00:00", text)
         self.assertIn("Messages: 2", text)
         self.assertIn("**2026-10-17 13:00 CEST** · "
                       "[Original message](https://t.me/synthetic_course/3)\n\n"
@@ -274,6 +290,43 @@ class ExportTests(TemporaryExports):
         self.assertIn("Synthetic message 2", text)
         self.assertEqual(previous.read_bytes(), original)
 
+    def test_fractional_checkpoint_reprocesses_boundary_second(self):
+        since = NOW - timedelta(hours=1)
+        fractional_end = since.replace(microsecond=654321)
+        previous = checkpoint(self.exports, "previous.md", fractional_end.isoformat())
+        original = previous.read_bytes()
+        self.client.messages[-1] = [message(4, NOW), message(3, NOW - timedelta(seconds=1)),
+                                    message(2, since), message(1, since - timedelta(seconds=1))]
+        self.run_export()
+        path, = [path for path in self.files() if path != previous]
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("Messages: 2", text)
+        self.assertIn("synthetic_course/2)", text)
+        self.assertNotIn("synthetic_course/1)", text)
+        self.assertNotIn("synthetic_course/4)", text)
+        self.assertEqual(digest.read_export_end(path), NOW)
+        self.assertEqual(digest.read_export_end(previous), fractional_end)
+        self.assertEqual(previous.read_bytes(), original)
+
+    def test_explicit_days_floor_boundaries_and_preserve_exact_duration(self):
+        for days in (1, 3, 7):
+            with self.subTest(days=days):
+                since = NOW - timedelta(days=days)
+                self.client.messages[-1] = [message(4, NOW), message(3, NOW - timedelta(seconds=1)),
+                                            message(2, since), message(1, since - timedelta(seconds=1))]
+                before = set(self.files())
+                self.run_export(days=days)
+                path, = set(self.files()) - before
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("Messages: 2", text)
+                self.assertIn("synthetic_course/2)", text)
+                self.assertNotIn("synthetic_course/1)", text)
+                self.assertNotIn("synthetic_course/4)", text)
+                end = digest.read_export_end(path)
+                self.assertEqual(end, NOW)
+                self.assertEqual(end - digest.export_start(self.exports, days, EXECUTION_TIME),
+                                 timedelta(hours=days * 24))
+
     def test_explicit_days_override_previous_export(self):
         checkpoint(self.exports, "previous.md", (NOW - timedelta(days=10)).isoformat())
         self.client.messages[-1] = [message(3, NOW - timedelta(days=3)),
@@ -304,13 +357,13 @@ class ExportTests(TemporaryExports):
 
     def test_adjacent_exports_include_exact_boundary_once(self):
         boundary = NOW.replace(microsecond=0)
-        FrozenDateTime.current = boundary
+        FrozenDateTime.current = boundary.replace(microsecond=123456)
         self.client.messages[-1] = [message(4, boundary + timedelta(seconds=1)),
                                     message(3, boundary), message(2, boundary),
                                     message(1, boundary - timedelta(seconds=1))]
         self.run_export()
         first, = self.files()
-        FrozenDateTime.current = boundary + timedelta(seconds=2)
+        FrozenDateTime.current = boundary + timedelta(seconds=2, microseconds=987654)
         self.run_export()
         second, = [path for path in self.files() if path != first]
         first_text = first.read_text(encoding="utf-8")
@@ -319,6 +372,101 @@ class ExportTests(TemporaryExports):
         self.assertIn("Messages: 3", second_text)
         for mid in (1, 2, 3, 4):
             self.assertEqual((first_text + second_text).count(f"synthetic_course/{mid})"), 1)
+
+    def test_late_same_second_message_is_included_in_next_export(self):
+        self.client.dialogs.append(dialog(-2))
+        self.chats.return_value["Other synthetic course"] = -2
+        self.client.messages[-1] = [message(1, NOW - timedelta(seconds=1))]
+        self.client.messages[-2] = [message(3, NOW)]
+        late = message(2, NOW)
+        late.reply_to_msg_id = 1
+        iterate = self.client.iter_messages
+
+        async def arrive_after_scan(entity):
+            async for item in iterate(entity):
+                yield item
+            if entity.chat_id == -1:
+                # This message becomes visible only after its group was scanned.
+                FrozenDateTime.current = NOW.replace(microsecond=900000)
+                self.client.messages[-1].insert(0, late)
+
+        with patch.object(self.client, "iter_messages", arrive_after_scan):
+            self.run_export()
+        first, = self.files()
+        FrozenDateTime.current = NOW + timedelta(seconds=1, microseconds=234567)
+        self.run_export()
+        second, = [path for path in self.files() if path != first]
+        first_text = first.read_text(encoding="utf-8")
+        second_text = second.read_text(encoding="utf-8")
+        self.assertIn("synthetic_course/2)", second_text)
+        self.assertIn("Reply to #1", second_text)
+        self.assertNotIn("synthetic_course/2)", first_text)
+        self.assertNotIn("synthetic_course/3)", first_text)
+        self.assertIn("synthetic_course/3)", second_text)
+        self.assertEqual(digest.read_export_end(first), NOW)
+        self.assertEqual(digest.read_export_end(second), NOW + timedelta(seconds=1))
+        for mid in (1, 2, 3):
+            self.assertEqual((first_text + second_text).count(f"synthetic_course/{mid})"), 1)
+
+    def test_repeated_runs_in_same_second_defer_messages_until_second_is_complete(self):
+        self.client.messages[-1] = [message(1, NOW)]
+        for execution in (EXECUTION_TIME, NOW.replace(microsecond=900000)):
+            FrozenDateTime.current = execution
+            self.run_export()
+        first_two = self.files()
+        self.assertEqual(len(first_two), 2)
+        for path in first_two:
+            self.assertEqual(digest.read_export_end(path), NOW)
+            self.assertIn("Messages: 0", path.read_text(encoding="utf-8"))
+        FrozenDateTime.current = NOW + timedelta(seconds=1, microseconds=123456)
+        self.run_export()
+        third, = set(self.files()) - set(first_two)
+        self.assertIn("Messages: 1", third.read_text(encoding="utf-8"))
+        self.assertEqual(digest.read_export_end(third), NOW + timedelta(seconds=1))
+
+    def test_upper_boundary_is_captured_before_connecting(self):
+        def connect_later():
+            FrozenDateTime.current = NOW + timedelta(seconds=10, microseconds=999999)
+            return 1, "synthetic-api-hash"
+
+        digest.credentials.side_effect = connect_later
+        self.client.messages[-1] = [message(2, NOW + timedelta(seconds=5)),
+                                    message(1, NOW - timedelta(seconds=1))]
+        self.run_export()
+        path, = self.files()
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(digest.read_export_end(path), NOW)
+        self.assertIn("Messages: 1", text)
+        self.assertNotIn("synthetic_course/2)", text)
+
+    def test_consecutive_windows_across_midnight_and_rome_dst(self):
+        for label, boundary in [
+            ("UTC midnight", datetime(2026, 10, 17, 23, 59, 59, tzinfo=UTC)),
+            ("Rome midnight", datetime(2026, 10, 17, 21, 59, 59, tzinfo=UTC)),
+            ("Rome spring DST", datetime(2026, 3, 29, 0, 59, 59, tzinfo=UTC)),
+            ("Rome autumn DST", datetime(2026, 10, 25, 0, 59, 59, tzinfo=UTC)),
+        ]:
+            with self.subTest(boundary=label), tempfile.TemporaryDirectory() as temporary:
+                output_dir = Path(temporary) / "exports"
+                self.client.messages[-1] = [message(4, boundary + timedelta(seconds=2)),
+                                            message(3, boundary + timedelta(seconds=1)),
+                                            message(2, boundary),
+                                            message(1, boundary - timedelta(seconds=1))]
+                with patch.object(digest, "ROOT", Path(temporary)):
+                    FrozenDateTime.current = boundary.astimezone(digest.ROME).replace(microsecond=123456)
+                    self.run_export()
+                    first, = output_dir.glob("*.md")
+                    next_execution = boundary + timedelta(seconds=2, microseconds=987654)
+                    self.assertEqual(digest.export_start(output_dir, None, next_execution), boundary)
+                    FrozenDateTime.current = next_execution.astimezone(timezone(timedelta(hours=-4)))
+                    self.run_export()
+                second, = [path for path in output_dir.glob("*.md") if path != first]
+                self.assertEqual(digest.read_export_end(first), boundary)
+                self.assertEqual(digest.read_export_end(second), boundary + timedelta(seconds=2))
+                text = first.read_text(encoding="utf-8") + second.read_text(encoding="utf-8")
+                for mid in (1, 2, 3):
+                    self.assertEqual(text.count(f"synthetic_course/{mid})"), 1)
+                self.assertNotIn("synthetic_course/4)", text)
 
     def test_unrenderable_messages_still_allow_empty_checkpoint(self):
         self.client.messages[-1] = [message(2, None), message(1, NOW - timedelta(hours=1), body="")]

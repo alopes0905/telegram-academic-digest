@@ -67,10 +67,11 @@ def read_export_end(path):
 
 
 def export_start(output_dir, days, now):
+    """Validate checkpoints against the execution instant before flooring the start."""
     if days is not None:
         if days < 1:
             raise SystemExit("--days must be a positive integer")
-        return now - timedelta(days=days)
+        return now.replace(microsecond=0) - timedelta(days=days)
     latest = None
     for path in output_dir.glob("*.md"):
         if not path.is_file():
@@ -84,7 +85,7 @@ def export_start(output_dir, days, now):
             continue
         if end is not None and (latest is None or end > latest):
             latest = end
-    return latest if latest is not None else now - timedelta(days=1)
+    return (latest if latest is not None else now - timedelta(days=1)).replace(microsecond=0)
 
 
 def write_export(output_dir, now, days, lines):
@@ -171,9 +172,11 @@ def format_message(message, dialog):
 
 async def run(args):
     if args.command == "export":
-        now = datetime.now(timezone.utc)
+        execution_time = datetime.now(timezone.utc)
+        # Telegram dates have second precision; defer the incomplete current second.
+        now = execution_time.replace(microsecond=0)
         output_dir = ROOT / "exports"
-        since = export_start(output_dir, args.days, now)
+        since = export_start(output_dir, args.days, execution_time)
         chats = selected_chats()
     api_id, api_hash = credentials()
     session_dir = ROOT / "secrets"
